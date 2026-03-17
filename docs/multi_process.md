@@ -11,8 +11,9 @@ The main idea
 - **Run multiple Python processes**, which we sometimes call "controllers." We
   can run one (or more) process per host machine.
 - **Initialize the cluster with {func}`jax.distributed.initialize`**.
-- **A {class}`jax.Array` can span all processes**, and if each process applies
-  the same JAX function to it, it's like programming against one big device.
+- **A {class}`jax.Array` can span devices across multiple processes**, and if
+  each process applies the same JAX function to it, it's like programming
+  against one big device.
 - **Use the same [unified sharding mechanism][unified_sharding]** as in
   single-controller JAX to control how data is distributed and computation is
   parallelized. XLA automatically exploits high-speed networking links like TPU
@@ -735,8 +736,9 @@ result = g(z)
 
 Thanks to JAX's {doc}`async_dispatch`, {func}`jax.jit` functions and/or
 {func}`jax.device_put`s running on different devices will run in parallel if
-their inputs are ready. We can take advantage of this to implement a very
-simple example of microbatched pipeline parallelism:
+their inputs are ready. We can take advantage of this to implement
+microbatched pipeline parallelism, where different stages of a model run on
+different devices and process successive microbatches concurrently:
 
 ```python
 # Pipeline stage functions. Each stage will run on a different device.
@@ -763,6 +765,80 @@ Cross-process {func}`jax.device_put` is currently supported only when the
 source and destination shardings contain the same number of devices and have
 the same shard shapes. If you're finding this overly restrictive, please file a
 [Github Issue](https://github.com/jax-ml/jax/issues).
+
+### More on Pipeline Parallelism
+
+For a more complete example of pipeline parallelism with `jax.device_put`, see
+[mlp_forward_pass.py](https://github.com/jax-ml/jax/blob/main/examples/pipeline-parallelism/mlp_forward_pass.py),
+which expands on the simple pipeline-parallel MLP forward pass described above.
+In `mlp_forward_pass.py`, each pipeline stage is assigned to a different process's
+devices using a separate mesh and jitted function:
+
+```python
+# Create the meshes for each stage. Stage i holds devices managed by process i.
+def make_stage_mesh(process_id):
+    stage_devices = jax.local_devices(process_index=process_id)
+    return jax.make_mesh(
+        (len(stage_devices),),
+        ("data",),
+        devices=stage_devices,
+    )
+
+
+stage_meshes = [make_stage_mesh(process_id) for process_id in range(NUM_PROCS)]
+
+
+# Define the computations that will run on each stage. Each stage executes one
+# layer of the MLP. The last stage does not apply the activation function.
+def make_stage_fn(stage_idx, num_stages):
+    def stage_fwd(x, W):
+        x = x @ W
+        if stage_idx != num_stages - 1:
+            x = jax.nn.relu(x)
+        return x
+
+    return jax.jit(stage_fwd)
+
+
+stage_fns = [make_stage_fn(stage_idx, NUM_PROCS) for stage_idx in range(NUM_PROCS)]
+```
+
+The forward pass loops over microbatches and stages, using
+{func}`jax.device_put` to transfer activations between stages:
+
+```python
+def mlp_fwd(microbatches, stage_params):
+    results = []
+    for microbatch in microbatches:
+        for stage_mesh, stage_fn, W in zip(stage_meshes, stage_fns, stage_params):
+            curr_microbatch_sharding = NamedSharding(
+                stage_mesh,
+                microbatch.sharding.spec,
+            )
+            microbatch = jax.device_put(microbatch, curr_microbatch_sharding)
+            microbatch = stage_fn(microbatch, W)
+        results.append(microbatch)
+    return results
+```
+
+Because {func}`jax.device_put` and {func}`jax.jit` dispatch asynchronously,
+different stages process different microbatches in parallel -- achieving
+pipeline parallelism. You can verify this by profiling with
+[NVIDIA Nsight Systems](https://developer.nvidia.com/nsight-systems) (GPU) or
+{doc}`xprof <profiling>` (GPU and TPU).
+
+A [pipeline-parallel training example](https://github.com/jax-ml/jax/blob/main/examples/pipeline-parallelism/mlp_training.py)
+using the GPipe schedule is also available.
+
+```{note}
+A key consideration for performant pipeline parallelism is the degree of
+overlap between communication and computation (comm/compute overlap). Achieving
+good overlap with {func}`jax.device_put` can depend on the order in which work
+is enqueued, and improved performance is not guaranteed by increasing the degree
+of overlap. See [this discussion](TODO: LINK TO GITHUB DISCUSSION) for more
+details, and please file a [GitHub issue](https://github.com/jax-ml/jax/issues)
+if you run into difficulties.
+```
 
 ## Making process-spanning arrays from external data
 
