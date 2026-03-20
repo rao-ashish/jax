@@ -2430,6 +2430,63 @@ def device_put(
           copy_semantics=tuple(copy_semantics))
     return tree_unflatten(treedef, out_flat)
 
+def device_put_to_refs(
+    x,
+    dst_array_refs: Sequence[core.Ref],
+    donate: bool | Any = False):
+  """Transfers ``x`` into ``dst_array_refs``. Assumes that all `dst_array_refs`
+     point to different arrays, and that no arrays inside `x` are also
+     referenced in `dst_array_refs` (i.e. that transfers can occur in any
+     order).
+
+    Args:
+      x: An array, scalar, or PyTree thereof.
+      dst_array_refs: A jax.Ref or PyTree thereof that has the same
+          structure as `x`. If `x` is a PyTree, each leaf of `x` will be
+          copied into the corresponding jax.Ref of `dst_array_refs`.
+  """
+
+  # Flatten src arrays and dst refs.
+  x_flat, treedef = tree_flatten(x)
+  dst_array_refs_flat = flatten_axes(
+    "device_put_to_refs dst_array_refs", treedef, dst_array_refs
+  )
+
+  # The destination refs must be pairwise distinct and disjoint from any
+  # source arrays, so the transfer order does not affect semantics.
+  dst_buf_ids = []
+  for dst_ref in dst_array_refs_flat:
+    if not isinstance(dst_ref, core.Ref):
+      raise TypeError(
+          "device_put_to_refs dst_array_refs must have jax.Ref leaves. "
+          f"Got leaf of type: {type(dst_ref)}")
+    dst_buf_ids.append(id(dst_ref._refs._buf))
+  if len(set(dst_buf_ids)) != len(dst_buf_ids):
+    raise ValueError("device_put_to_refs dst_array_refs must be unique.")
+
+  src_array_ids = set()
+  for leaf in x_flat:
+    if isinstance(leaf, array.ArrayImpl):
+      src_array_ids.add(id(leaf))
+  if src_array_ids.intersection(dst_buf_ids):
+    raise ValueError(
+        "device_put_to_refs requires disjoint source arrays and "
+        "destination refs.")
+
+  # TODO: Support JAX transforms.
+  assert core.trace_state_clean()
+
+  # Perform transfers.
+  copy_semantics = [
+    dispatch.ArrayCopySemantics.DONATE_INPUT
+    if donate else dispatch.ArrayCopySemantics.ALWAYS_COPY
+    for _ in range(len(x_flat))
+  ]
+
+  dispatch._batched_device_put_to_refs_impl(
+      *x_flat,
+      dst_refs=dst_array_refs_flat,
+      copy_semantics=copy_semantics)
 
 def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # noqa: F811
   """Transfer array shards to specified devices and form Array(s).

@@ -552,6 +552,7 @@ array_result_handler = _xla.array_result_handler
 batched_copy_array_to_devices_with_sharding = (
     _xla.batched_copy_array_to_devices_with_sharding
 )
+batched_copy_arrays_to = _xla.batched_copy_arrays_to
 batched_device_put = _xla.batched_device_put
 reorder_shards = _xla.reorder_shards
 batched_block_until_ready = _xla.batched_block_until_ready

@@ -102,6 +102,7 @@ from jax._src.xla_bridge import default_backend as default_backend
 from jax._src.xla_bridge import device_count as device_count
 from jax._src.api import device_get as device_get
 from jax._src.api import device_put as device_put
+from jax._src.api import device_put_to_refs as device_put_to_refs
 from jax._src.api import device_put_sharded as _deprecated_device_put_sharded
 from jax._src.api import device_put_replicated as _deprecated_device_put_replicated
 from jax._src.xla_bridge import devices as devices

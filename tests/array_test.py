@@ -230,6 +230,30 @@ class JaxArrayTest(jtu.JaxTestCase):
     for z_s in z.addressable_shards:
       self.assertArraysEqual(z_s.data, x[z_s.index])
 
+  def test_device_put_to_refs_simple(self):
+    if len(jax.devices()) < 2:
+      self.skipTest("Need at least 2 devices for this test.")
+
+    n_half = len(jax.devices()) // 2
+
+    src_devices = jax.devices()[: n_half]
+    src_sharding = jax.sharding.NamedSharding(Mesh(src_devices, ("x",)), P("x"))
+
+    dst_devices = jax.devices()[n_half : 2 * n_half]
+    dst_sharding = jax.sharding.NamedSharding(Mesh(dst_devices, ("x",)), P("x"))
+
+    src_arr = jax.device_put(
+      jnp.arange(64, dtype=np.int32).reshape(8, 8), src_sharding)
+    dst_arr = jnp.zeros_like(src_arr, device=dst_sharding)
+    dst_ref = jax.new_ref(dst_arr)
+
+    jax.device_put_to_refs(src_arr, dst_ref)
+    out = dst_ref[...]
+
+    self.assertEqual(out.sharding, dst_sharding)
+    for shard in out.addressable_shards:
+      self.assertArraysEqual(shard.data, src_arr[shard.index])
+
   def test_array_device_get(self):
     global_mesh = jtu.create_mesh((4, 2), ('x', 'y'))
     input_shape = (8, 2)

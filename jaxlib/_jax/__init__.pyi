@@ -1047,6 +1047,14 @@ def batched_copy_array_to_devices_with_sharding(
     arg3: Sequence[ArrayCopySemantics],
     /,
 ) -> list[Array]: ...
+
+def batched_copy_arrays_to(
+    arg0: Sequence[Array],
+    arg1: Sequence[DeviceList],
+    arg3: Sequence[ArrayCopySemantics],
+    /,
+) -> None: ...
+
 def array_result_handler(
     aval: object, sharding: object, committed: bool, _skip_checks: bool = ...
 ) -> ResultHandler: ...

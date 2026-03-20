@@ -1053,6 +1053,41 @@ class CrossHostTransferTest(jt_multiprocess.MultiProcessTest):
         self.assertEmpty(z.addressable_shards)
 
   @jtu.skip_on_devices("cpu")
+  def test_cross_host_device_put_to_refs_simple(self):
+    n_local = jax.local_device_count()
+    src_pid = 0
+    dst_pid = 1
+
+    src_sharding = jax.sharding.NamedSharding(
+        jax.make_mesh((n_local,), ("x",),
+                      devices=jax.local_devices(process_index=src_pid),
+                      axis_types=(jax.sharding.AxisType.Explicit,)),
+        P("x"))
+    dst_sharding = jax.sharding.NamedSharding(
+        jax.make_mesh((n_local,), ("x",),
+                      devices=jax.local_devices(process_index=dst_pid),
+                      axis_types=(jax.sharding.AxisType.Explicit,)),
+        P("x"))
+
+    src_arr = jax.device_put(
+        jnp.arange(64, dtype=np.int32).reshape(8, 8), src_sharding)
+    dst_arr = jnp.zeros_like(src_arr, device=dst_sharding)
+    dst_ref = jax.new_ref(dst_arr)
+
+    jax.device_put_to_refs(src_arr, dst_ref)
+    out = dst_ref[...]
+
+    expected_out = jax.device_put(
+        jnp.arange(64, dtype=np.int32).reshape(8, 8), dst_sharding)
+
+    if jax.process_index() == dst_pid:
+      self.assertGreater(len(out.addressable_shards), 0)
+      for shard in out.addressable_shards:
+        np.testing.assert_array_equal(shard.data, expected_out[shard.index])
+    else:
+      self.assertEmpty(out.addressable_shards)
+
+  @jtu.skip_on_devices("cpu")
   def test_device_to_cpu_transfer_jit(self):
     x = jnp.arange(64).reshape(8, 8)
     with self.assertWarnsRegex(

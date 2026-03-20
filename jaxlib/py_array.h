@@ -323,6 +323,11 @@ class PyArray : public nanobind::object {
       absl::Span<const xla::ifrt::DeviceListRef> dst_device_lists,
       absl::Span<const nanobind::object> dst_shardings,
       absl::Span<const xla::ifrt::ArrayCopySemantics> array_copy_semantics);
+  
+  static absl::Status BatchedCopyArraysTo(
+      absl::Span<const PyArray> src_py_arrays,
+      absl::Span<const PyArray> dst_py_arrays,
+      absl::Span<const xla::ifrt::ArrayCopySemantics> array_copy_semantics);
 
   static absl::StatusOr<PyArray> BatchedDevicePut(
       nanobind::object aval, nanobind::object sharding,
