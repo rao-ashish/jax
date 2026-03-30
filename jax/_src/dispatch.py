@@ -640,6 +640,62 @@ def _batched_device_put_impl(
 
   return ys
 
+def _batched_device_put_to_refs_impl(
+    *xs,
+    dst_refs: Sequence[core.Ref],
+    copy_semantics: Sequence[ArrayCopySemantics]):
+
+  # This function is identical to _batched_device_put_impl, except:
+  #   1. For cross-host transfers, we call into xc.batched_copy_arrays_to
+  #      instead of xc.batched_copy_array_to_devices_with_sharding.
+  #   2. For other transfers, after completing them, we copy the outputs into
+  #      the corresponding dst_refs.
+  #   3. Nothing is returned as dst_refs are mutated in-place.
+
+  # Used to batch transfers when _device_put_impl returns a _DeferredShardArg.
+  dsa_vals, dsa_indices, dsa_xs, dsa_shardings, dsa_copy_semantics = \
+    [], [], [], [], []
+
+  # Used to batch transfers when _device_put_impl returns a
+  # _DeferredCrossHostTransferArg.
+  dca_indices, dca_src_arrays, dca_dst_arrays, dca_copy_semantics = \
+    [], [], [], []
+
+  for i, (x, dst_ref, cp) in enumerate(zip(xs, dst_refs, copy_semantics)):
+    device = dst_ref.sharding
+
+    y = _device_put_impl(x, device=device, src=None, copy=cp, aval=None)
+    if isinstance(y, _DeferredShardArg):
+      dsa_vals.append(y)
+      dsa_indices.append(i)
+      dsa_xs.append(y.x)
+      dsa_shardings.append(y.s)
+      dsa_copy_semantics.append(y.copy_semantics)
+    elif isinstance(y, _DeferredCrossHostTransferArg):
+      dca_indices.append(i)
+      dca_src_arrays.append(y.x)
+      dca_dst_arrays.append(dst_ref._refs._buf)
+      dca_copy_semantics.append(y.copy_semantics)
+    else:
+      dst_ref[...] = y
+
+  # Batch shard_arg / batched_copy_arrays_to calls.
+  # Helps improve efficiency for backends that support efficient batch transfer.
+  if dsa_xs:
+    # device_put handles `Format` via a different path, so just pass `None` as
+    # the layout here.
+    shard_arg_results = pxla.shard_args(dsa_shardings, [None] * len(dsa_xs),
+                                        dsa_copy_semantics, dsa_xs)
+    for i, dsa_val, shard_arg_result in zip(
+        dsa_indices, dsa_vals, shard_arg_results):
+      assert isinstance(dsa_val, _DeferredShardArg)
+      dst_refs[i][...] = dsa_val.result_handler(shard_arg_result)
+  if dca_src_arrays:
+    dca_outputs = xc.batched_copy_arrays_to(
+        dca_src_arrays, dca_dst_arrays, dca_copy_semantics)
+    for dst_array, output_array in zip(dca_dst_arrays, dca_outputs):
+      dst_array._replace_with(output_array)
+
 def batched_device_put_impl(
     *xs,
     devices: Sequence[Device | Sharding | Format | None],

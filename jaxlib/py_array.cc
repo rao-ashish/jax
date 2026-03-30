@@ -1366,6 +1366,120 @@ absl::StatusOr<std::vector<PyArray>> PyArray::BatchedCopyToDeviceWithSharding(
   return results;
 }
 
+
+absl::StatusOr<std::vector<PyArray>> PyArray::BatchedCopyArraysTo(
+  absl::Span<const PyArray> src_py_arrays,
+  absl::Span<const PyArray> dst_py_arrays,
+  absl::Span<const ifrt::ArrayCopySemantics> array_copy_semantics) {
+  if (src_py_arrays.empty()) {
+    return std::vector<PyArray>();
+  }
+
+  TF_RET_CHECK(src_py_arrays.size() == dst_py_arrays.size());
+
+  ifrt::Client *const client = src_py_arrays.front().ifrt_array()->client();
+
+  // Arrays to be copied, grouped by source/destination devices and memory
+  // kinds. The grouping is enforced by `ifrt::Client::CopyArraysTo()`.
+  struct Batch {
+    std::vector<int> indexes;
+    std::vector<ifrt::ArrayRef> src_ifrt_arrays;
+    std::vector<ifrt::ArrayRef> dst_ifrt_arrays;
+  };
+  absl::flat_hash_map<BatchedCopyToDeviceWithShardingKey, Batch> batches;
+
+  PyUserContextScope user_context_scope;
+  {
+    tsl::profiler::TraceMe results_traceme("BatchedCopyArraysTo create batch");
+    for (int i = 0; i < src_py_arrays.size(); ++i) {
+      const auto &src_py_array = src_py_arrays[i];
+      const auto &dst_py_array = dst_py_arrays[i];
+      const auto &dst_sharding = dst_py_array.sharding();
+      const auto &array_cs = array_copy_semantics[i];
+
+      TF_RET_CHECK(array_cs != ifrt::ArrayCopySemantics::kReuseInput)
+          << "BatchedCopyArraysTo is incompatible with "
+             "ArrayCopySemantics::kReuseInput";
+
+      auto *src_ifrt_array_ptr = src_py_array.ifrt_array();
+      const ifrt::DeviceListRef &src_devices =
+          src_ifrt_array_ptr->sharding().devices();
+
+      auto *dst_ifrt_array_ptr = dst_py_array.ifrt_array();
+      const ifrt::DeviceListRef &dst_devices =
+          dst_ifrt_array_ptr->sharding().devices();
+
+      ifrt::MemoryKind src_memory_kind = ifrt::CanonicalizeMemoryKind(
+          src_ifrt_array_ptr->sharding().memory_kind(),
+          src_devices->devices().front());
+      ifrt::MemoryKind dst_memory_kind = ifrt::CanonicalizeMemoryKind(
+          dst_ifrt_array_ptr->sharding().memory_kind(),
+          dst_devices->devices().front());
+
+      auto transfer_guard_formatter = [&src_py_array, &dst_py_array, &dst_sharding] {
+        return absl::StrCat(
+            "src_aval=",
+            nb::cast<std::string_view>(nb::repr(src_py_array.aval())),
+            ", dst_aval=",
+            nb::cast<std::string_view>(nb::repr(dst_py_array.aval())),
+            ", src_sharding=",
+            nb::cast<std::string_view>(nb::repr(src_py_array.sharding())),
+            ", dst_sharding=",
+            nb::cast<std::string_view>(nb::repr(dst_sharding)));
+      };
+      TF_RETURN_IF_ERROR(
+          ApplyTransferGuardToDeviceToDevice(transfer_guard_formatter));
+
+      Batch &batch = batches[BatchedCopyToDeviceWithShardingKey{
+          src_devices, src_memory_kind, dst_devices, dst_memory_kind,
+          array_cs}];
+      batch.indexes.push_back(i);
+      batch.src_ifrt_arrays.push_back(tsl::FormRef(src_ifrt_array_ptr));
+      batch.dst_ifrt_arrays.push_back(tsl::FormRef(dst_ifrt_array_ptr));
+    }
+  }
+
+  std::vector<std::pair<int, ifrt::ArrayRef>> ifrt_arrays;
+  {
+    GlobalPyRefManager()->CollectGarbage();
+    nb::gil_scoped_release gil_release;
+
+    tsl::profiler::TraceMe copy_traceme("BatchedCopyArraysTo: dispatch");
+    for (auto &[key, batch] : batches) {
+      TF_ASSIGN_OR_RETURN(
+          auto copied,
+          client->CopyArraysInto(absl::MakeSpan(batch.src_ifrt_arrays),
+                                 absl::MakeSpan(batch.dst_ifrt_arrays),
+                                 key.array_copy_semantics));
+      for (int i = 0; i < batch.indexes.size(); ++i) {
+        ifrt_arrays.push_back(
+            std::make_pair(batch.indexes[i], std::move(copied[i])));
+      }
+    }
+  }
+
+  tsl::profiler::TraceMe results_traceme("BatchedCopyArraysTo create results");
+  std::vector<PyArray> results(dst_py_arrays.size());
+  for (auto &[i, ifrt_array] : ifrt_arrays) {
+    const auto &dst_py_array = dst_py_arrays[i];
+    absl::Span<const int64_t> shape_span = dst_py_array.shape();
+
+    TF_ASSIGN_OR_RETURN(nb_class_ptr<PyDeviceList> dst_device_list,
+                        GetPyDeviceList(dst_py_array.sharding()));
+    nb_class_ptr<PyClient> py_client = dst_device_list->py_client();
+
+    results[i] = PyArray(
+        dst_py_array.aval(), dst_py_array.weak_type(), dst_py_array.dtype(),
+        std::vector<int64_t>(shape_span.begin(), shape_span.end()),
+        dst_py_array.sharding(), py_client, std::move(ifrt_array),
+        dst_py_array.committed(),
+        /*skip_checks=*/true, dst_py_array.result_status());
+  }
+
+  return results;
+}
+
+
 absl::StatusOr<PyArray> PyArray::BatchedDevicePut(
     nb::object aval, nb::object sharding, std::vector<nb::object> xs,
     absl::Span<const PyDevice* const> dst_devices, bool committed,
@@ -2380,6 +2494,16 @@ absl::Status PyArray::Register(nb::module_& m) {
         return xla::ValueOrThrow(PyArray::BatchedCopyToDeviceWithSharding(
             arrays, device_lists, shardings, array_copy_semantics));
       });
+  
+  m.attr("batched_copy_arrays_to") = nb::cpp_function(
+      [](absl::Span<const PyArray> src_arrays,
+        absl::Span<const PyArray> dst_arrays,
+        absl::Span<const ifrt::ArrayCopySemantics> array_copy_semantics) {
+        tsl::profiler::TraceMe traceme("batched_copy_arrays_to");
+        return xla::ValueOrThrow(PyArray::BatchedCopyArraysTo(
+          src_arrays, dst_arrays, array_copy_semantics));
+      });
+
   m.attr("array_result_handler") = nb::cpp_function(
       [](nb::object aval, nb::object sharding, bool committed,
          bool skip_checks) -> nb_class_ptr<PyArrayResultHandler> {
